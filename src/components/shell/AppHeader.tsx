@@ -9,7 +9,7 @@ import { useCart } from "../cart/CartProvider";
 import { useRealtime } from "./RealtimeProvider";
 import { isActive, NAV_ITEMS } from "./nav-items";
 
-export function AppHeader({ name, imageUrl }: { name: string; imageUrl: string | null }) {
+export function AppHeader({ name, imageUrl, staff = false }: { name: string; imageUrl: string | null; staff?: boolean }) {
   const pathname = usePathname();
   const { count } = useCart();
   const { unread } = useRealtime();
@@ -49,6 +49,19 @@ export function AppHeader({ name, imageUrl }: { name: string; imageUrl: string |
                 </li>
               );
             })}
+            {staff && (
+              <li>
+                <Link
+                  href="/store"
+                  aria-current={isActive(pathname, "/store") ? "page" : undefined}
+                  className={`inline-flex min-h-11 items-center rounded-xl px-4 font-semibold ${
+                    isActive(pathname, "/store") ? "bg-gold-400 text-ink" : "text-ink hover:bg-gold-400/30"
+                  }`}
+                >
+                  Store app
+                </Link>
+              </li>
+            )}
           </ul>
         </nav>
 

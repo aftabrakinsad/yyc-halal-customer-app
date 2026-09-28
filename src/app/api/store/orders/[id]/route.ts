@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { apiUser, STAFF_ROLES } from "@/lib/auth-helpers";
+import { apiStaff } from "@/lib/auth-helpers";
 import { db } from "@/lib/db";
 import { handle, HttpError } from "@/lib/http";
 import { loadReceipt } from "@/lib/receipt";
@@ -7,7 +7,7 @@ import { loadReceipt } from "@/lib/receipt";
 type Ctx = { params: Promise<{ id: string }> };
 
 export const GET = handle(async (_req: Request, ctx: Ctx) => {
-  await apiUser(STAFF_ROLES);
+  await apiStaff("viewOrders");
   const { id } = await ctx.params;
   const receipt = await loadReceipt(id);
   if (!receipt) throw new HttpError(404, "Order not found.");

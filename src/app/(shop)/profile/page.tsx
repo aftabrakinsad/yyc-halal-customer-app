@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { signOut } from "@/auth";
-import { avatarUrl, requireUser } from "@/lib/auth-helpers";
+import { avatarUrl, isStaff, requireUser } from "@/lib/auth-helpers";
 import { formatDate } from "@/lib/money";
 import { AvatarUploader } from "@/components/profile/AvatarUploader";
 import { PushToggle } from "@/components/profile/PushToggle";
@@ -30,6 +30,16 @@ export default async function ProfilePage() {
         <span className="flex-1">My order history</span>
         <ChevronRightIcon className="text-muted" />
       </Link>
+
+      {isStaff(user.role) && (
+        <Link href="/store" className="card flex min-h-16 items-center gap-3 border-2 border-gold-400 p-4 font-bold hover:bg-gold-400/10">
+          <span className="rounded-full bg-gold-400 p-2 text-ink">
+            <ReceiptIcon />
+          </span>
+          <span className="flex-1">Open the store app (staff)</span>
+          <ChevronRightIcon className="text-muted" />
+        </Link>
+      )}
 
       <section className="card space-y-3 p-5">
         <h2 className="text-lg font-bold">Notifications</h2>

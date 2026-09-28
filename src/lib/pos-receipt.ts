@@ -42,5 +42,7 @@ export function posReceiptText(r: ReceiptData, kind: "RECEIPT" | "REFUND" = "REC
   lines.push(`Payment: ${r.payment?.method ?? "-"}`);
   lines.push(`Status: ${PAYMENT_STATUS_LABEL[r.paymentStatus]}`);
   lines.push(rule, center(r.store.footer), "", "", "");
-  return lines.filter((l) => l !== "").join("\n") + "\n\n\n";
+  // Thermal printers use a Latin-1 code page: swap characters they can't print.
+  const text = lines.filter((l) => l !== "").join("\n") + "\n\n\n";
+  return text.replace(/•/g, "*").replace(/[–—]/g, "-").replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/[^\x00-\xff]/g, "?");
 }

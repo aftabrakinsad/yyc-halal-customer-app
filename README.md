@@ -11,11 +11,11 @@ It also hosts the **shared backend and database** that the YYC Halal Store Manag
 npm install
 npm run db:local          # terminal 1: local Postgres-compatible DB on :5433 (no Docker needed)
 npm run db:migrate && npm run db:seed
-npm run dev               # terminal 2: http://localhost:3000
+npm run dev               # terminal 2: customer app http://localhost:3000 · store app http://localhost:3000/store
 ```
 
 The default `.env` runs without any external accounts:
-- `AUTH_DEV_LOGIN=true` shows a **Developer sign-in** form (any email, any role). It's disabled in production builds.
+- `AUTH_DEV_LOGIN=true` shows a **Developer sign-in** form on `/login` and `/store/login` (any email, any role — pick `STORE_EMPLOYEE`, `STORE_MANAGER` or `ADMIN` for the store app). It's disabled in production builds.
 - `PAYMENT_PROVIDER=mock` simulates card payments (success or decline). Also refused in production.
 - With no `SMTP_URL`, emails (receipts, ready-for-pickup, refunds) print to the server console.
 
@@ -30,7 +30,7 @@ The default `.env` runs without any external accounts:
 | Apple Pay | Register & verify your domain in Stripe Dashboard → Payment method domains |
 | Email | `SMTP_URL`, `EMAIL_FROM` |
 | Push notifications (optional) | `npx web-push generate-vapid-keys` → `NEXT_PUBLIC_VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` |
-| POS print agent | `PRINT_AGENT_TOKEN` |
+| POS print agent | `PRINT_AGENT_TOKEN` (long random string; same value on the store computer) |
 | Links in emails | `APP_URL` |
 
 Local webhook testing: `stripe listen --forward-to localhost:3000/api/webhooks/stripe`.
@@ -46,25 +46,53 @@ Local webhook testing: `stripe listen --forward-to localhost:3000/api/webhooks/s
 5. Payment is confirmed by the **Stripe webhook** (the confirmation page also asks Stripe directly as a fallback). Only then is the order confirmed: stock deducted, order number `YYC-2026-000123` issued from an atomic per-year counter, status → **In Progress**, receipt emailed, print job queued.
 6. If an item sells out during payment, the order is automatically cancelled and fully refunded.
 
-## Store Management app integration (same database + these APIs)
+## Store app (`/store`)
 
-All require a signed-in user with a staff role. Every action is written to the append-only `AuditLog` (UPDATE/DELETE are blocked by a DB trigger).
+Sign in at **`/store/login`** with an approved Google account. Customer accounts are sent to a "not authorized" page.
+Only the menus a role may use are shown, and every API re-checks the role on the server (`src/lib/permissions.ts`).
 
-| Endpoint | Role | Purpose |
-| --- | --- | --- |
-| `GET /api/store/orders?status=IN_PROGRESS,READY_FOR_PICKUP` | employee+ | Order queue |
-| `GET /api/store/orders/:id` | employee+ | Full order + audit trail |
-| `POST /api/store/orders/:id/status` `{status}` | employee+ | `READY_FOR_PICKUP` / `COMPLETED` / back to `IN_PROGRESS` — notifies the customer instantly |
-| `POST /api/store/orders/:id/refunds` | manager+ | `{type:"FULL"}`, `{type:"PARTIAL",amountCents}`, `{type:"ITEM",items:[{orderItemId,quantity}]}` |
-| `POST /api/store/orders/:id/cancel` `{reason}` | manager+ | Full refund + restock |
-| `GET/PATCH /api/store/settings` | manager+ to edit | Tax rate (`taxRateBps`, 500 = 5%), tax label, pickup text, auto-print, accepting orders… |
-| `GET/POST /api/store/flyers`, `PATCH/DELETE /api/store/flyers/:id` | manager+ to edit | Home-page flyers, sales, promotions, announcements (with start/end dates) |
-| `GET/POST /api/store/products`, `PATCH /api/store/products/:id` | employee: stock only; manager: prices | Catalog & inventory |
-| `GET /api/store/print-jobs`, `GET/POST /api/store/print-jobs/:id` | staff or `Bearer PRINT_AGENT_TOKEN` | Receipt queue; `GET :id` returns 42-column text for ESC/POS thermal printers |
+| Section | Employee | Manager | Admin |
+| --- | :-: | :-: | :-: |
+| Dashboard — live order cards, Ready for Pickup / Picked Up, print receipt | ✓ | ✓ | ✓ |
+| Orders — search by order number, name or email; order detail & history | ✓ | ✓ | ✓ |
+| Refunds (full, cancel & refund, per-item) | | ✓ | ✓ |
+| Products, Inventory, Flyers, Reports & PDF | | ✓ | ✓ |
+| Employees, Settings, Audit Log | | | ✓ |
 
-Refunds made directly in the Stripe dashboard are picked up by the webhook and appear on the customer's order too.
+**First admin:** sign in once with Google, then set your role in the database:
+`UPDATE "User" SET role = 'ADMIN' WHERE email = 'you@gmail.com';` After that, admins approve everyone else on the Employees page.
+Disabling an employee or changing their role takes effect on their very next request.
 
-Roles: `CUSTOMER`, `STORE_EMPLOYEE`, `STORE_MANAGER`, `ADMIN` (set `User.role` in the database). New units of measure (kg, pack…) are rows in the `Unit` table. Each product also has a `taxable` flag for zero-rated groceries.
+**Live orders:** the dashboard listens to `/api/store/events`. A newly *paid* order (never a failed or abandoned checkout) appears
+within ~3 seconds with a NEW badge, a pop-up, an optional chime (Sound toggle) and a tab-title counter. Completed orders leave the
+dashboard but stay searchable.
+
+**Refund safety:** the server calculates every refund amount. The confirmation screen shows the order number, the original payment
+and the refund amount, and the employee must tick a confirmation. The request then has to repeat the order number and amount
+that were confirmed. The server refuses it if either no longer matches (e.g. a stale screen or tampering). Refunds can never exceed the
+amount paid, require a reason, and are audit-logged with the employee, items, amount, reason and processor refund ID.
+
+**Reports:** daily, weekly (Mon–Sun), monthly, quarterly, yearly or custom, in Calgary time. Gross sales are before tax; net sales
+subtract the before-tax part of refunds issued in the period, so refunded money is never counted as sales. **Download PDF** produces a
+letter-size business record.
+
+### POS receipt printer
+
+Each paid order (if *Print receipts automatically* is on), refund and manual **Print Receipt** press is queued. Run the agent on a
+computer in the store:
+
+```bash
+APP_URL=https://<your-domain> PRINT_AGENT_TOKEN=<same as server> PRINTER_HOST=<printer IP> node scripts/print-agent.mjs
+```
+
+It sends 42-column ESC/POS text to any network thermal printer on port 9100 (use `PRINTER_HOST=stdout` to test in a terminal).
+Staff can also use **Print from this computer** for an 80 mm receipt with the logo. Full card numbers are never printed or stored.
+
+### Store APIs
+
+All under `/api/store/*`, all role-checked: `orders` (search), `orders/:id`, `orders/:id/status`, `orders/:id/print`,
+`orders/:id/refunds/preview`, `orders/:id/refunds`, `orders/:id/cancel`, `products`, `products/:id`, `categories`, `uploads`,
+`flyers`, `flyers/:id`, `reports`, `reports/pdf`, `employees`, `employees/:id`, `settings`, `print-jobs`, `events`.
 
 ## Real-time updates
 

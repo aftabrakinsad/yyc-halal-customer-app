@@ -78,6 +78,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         if (user) {
           token.uid = user.id;
           token.role = user.role;
+          await audit({ actorId: user.id, actorRole: user.role, action: "LOGIN", entityType: "User", entityId: user.id, data: { provider: account.provider } });
         }
       }
       return token;

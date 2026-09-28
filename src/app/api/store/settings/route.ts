@@ -1,13 +1,13 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { apiUser, MANAGER_ROLES, STAFF_ROLES } from "@/lib/auth-helpers";
+import { apiStaff } from "@/lib/auth-helpers";
 import { audit } from "@/lib/audit";
 import { db } from "@/lib/db";
 import { clientIp, handle, parseBody } from "@/lib/http";
 import { getSettings } from "@/lib/settings";
 
 export const GET = handle(async () => {
-  await apiUser(STAFF_ROLES);
+  await apiStaff("viewOrders");
   return NextResponse.json(await getSettings());
 });
 
@@ -28,7 +28,7 @@ const schema = z
   .partial();
 
 export const PATCH = handle(async (req: Request) => {
-  const staff = await apiUser(MANAGER_ROLES);
+  const staff = await apiStaff("manageSettings");
   const data = await parseBody(req, schema);
   const before = await getSettings();
   const settings = await db.storeSettings.update({ where: { id: 1 }, data });

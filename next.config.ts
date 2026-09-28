@@ -2,7 +2,7 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   poweredByHeader: false,
-  serverExternalPackages: ["sharp"],
+  serverExternalPackages: ["sharp", "pdfkit"],
   async headers() {
     return [
       {

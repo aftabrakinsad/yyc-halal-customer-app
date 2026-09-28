@@ -9,6 +9,7 @@ import { cartHash, quoteCart, type CartItemInput, type Quote } from "../pricing"
 import { formatMoney, lineTotalCents, taxCents, TIME_ZONE, toMilli, fromMilli } from "../money";
 import { paymentProvider, providerFor, type PaymentSnapshot } from "../payments";
 import { createNotification, pushNotification } from "../notify";
+import { paymentMethodLabel } from "../labels";
 import { loadReceipt } from "../receipt";
 import { sendMail } from "../email";
 import { readyEmail, receiptEmail, refundEmail } from "../emails/templates";
@@ -269,11 +270,10 @@ export async function markOrderPaid(orderId: string, snap: PaymentSnapshot, prov
   });
 
   if (result.kind === "sold_out") {
-    await cancelOrder(
-      orderId,
-      SYSTEM,
-      `Sorry — ${result.soldOut.join(", ")} sold out while your payment was processing. You have been fully refunded.`,
-    );
+    await cancelOrder(orderId, SYSTEM, {
+      reasonCategory: "Product unavailable",
+      reason: `Sorry — ${result.soldOut.join(", ")} sold out while your payment was processing. You have been fully refunded.`,
+    });
   } else if (result.kind === "paid") {
     await Promise.all([sendReceiptEmail(orderId), pushNotification(result.notification)]);
   }
@@ -348,7 +348,9 @@ export async function updateOrderStatus(orderId: string, to: OrderStatus, actor:
       data: {
         status: to,
         readyAt: to === "READY_FOR_PICKUP" ? now : to === "IN_PROGRESS" ? null : undefined,
+        readyById: to === "READY_FOR_PICKUP" ? actor.id : to === "IN_PROGRESS" ? null : undefined,
         completedAt: to === "COMPLETED" ? now : undefined,
+        completedById: to === "COMPLETED" ? actor.id : undefined,
       },
     });
     let notification = null;
@@ -370,7 +372,7 @@ export async function updateOrderStatus(orderId: string, to: OrderStatus, actor:
       });
     }
     await audit(
-      { ...auditBy(actor), action: "ORDER_STATUS_CHANGED", entityType: "Order", entityId: orderId, data: { from: order.status, to } },
+      { ...auditBy(actor), action: "ORDER_STATUS_CHANGED", entityType: "Order", entityId: orderId, data: { orderNumber: order.orderNumber, from: order.status, to } },
       tx,
     );
     return { order: updated, notification };
@@ -386,70 +388,118 @@ export async function updateOrderStatus(orderId: string, to: OrderStatus, actor:
 
 // ───────────────────────────── Refunds & cancellation (store staff) ─────────────────────────────
 
+type ReasonFields = { reasonCategory?: string; reason?: string };
+
 export type RefundRequest =
-  | { type: "FULL"; reason?: string }
-  | { type: "PARTIAL"; amountCents: number; reason?: string }
-  | { type: "ITEM"; items: { orderItemId: string; quantity: number }[]; reason?: string }
-  | { type: "CANCELLATION"; reason?: string };
+  | ({ type: "FULL" } & ReasonFields)
+  | ({ type: "PARTIAL"; amountCents: number } & ReasonFields)
+  | ({ type: "ITEM"; items: { orderItemId: string; quantity: number }[] } & ReasonFields)
+  | ({ type: "CANCELLATION" } & ReasonFields);
+
+/**
+ * What the employee saw and confirmed. The server still computes the amount itself, then refuses
+ * to proceed if it doesn't match — so a stale screen or a tampered request can't move money.
+ */
+export type RefundGuard = { confirmOrderNumber: string; expectedAmountCents: number };
 
 /** `lineCents` is the pre-tax part of the refund; `amountCents` includes tax. */
-type RefundItemRecord = { orderItemId: string; productName: string; quantity: number; lineCents: number; amountCents: number };
+type RefundItemRecord = { orderItemId: string; productName: string; quantity: number; unitLabel?: string; lineCents: number; amountCents: number };
 
 function refundItems(json: Prisma.JsonValue | null): RefundItemRecord[] {
   return Array.isArray(json) ? (json as unknown as RefundItemRecord[]) : [];
 }
 
+const refundableOrderInclude = {
+  items: true,
+  payments: { where: { status: { in: PAID_STATES } }, orderBy: { createdAt: "desc" as const } },
+  refunds: { where: { status: "PENDING" as const } },
+};
+type RefundableOrder = Prisma.OrderGetPayload<{ include: typeof refundableOrderInclude }>;
+
+/** Server-side refund calculation. Never exceeds what's left of the original payment. */
+function computeRefund(order: RefundableOrder, req: RefundRequest) {
+  if (!order.orderNumber) throw new HttpError(404, "Order not found.");
+  const payment = order.payments[0];
+  if (!payment || !PAID_STATES.includes(order.paymentStatus)) throw new HttpError(409, "This order has nothing left to refund.");
+
+  const pendingCents = order.refunds.reduce((s, r) => s + r.amountCents, 0);
+  const remaining = order.totalCents - order.refundedCents - pendingCents;
+  if (remaining <= 0) throw new HttpError(409, "This order has already been fully refunded (or a refund is still processing).");
+
+  let amountCents = 0;
+  const items: RefundItemRecord[] = [];
+  if (req.type === "FULL" || req.type === "CANCELLATION") {
+    amountCents = remaining;
+  } else if (req.type === "PARTIAL") {
+    if (!Number.isInteger(req.amountCents) || req.amountCents <= 0) throw new HttpError(400, "Enter a refund amount.");
+    if (req.amountCents > remaining) throw new HttpError(400, `The most you can refund is ${formatMoney(remaining)}.`);
+    amountCents = req.amountCents;
+  } else {
+    const pendingItems = order.refunds.flatMap((r) => refundItems(r.items));
+    for (const reqItem of req.items) {
+      if (!(reqItem.quantity > 0)) continue;
+      const item = order.items.find((i) => i.id === reqItem.orderItemId);
+      if (!item) throw new HttpError(400, "That item isn't part of this order.");
+      const pending = pendingItems.filter((p) => p.orderItemId === item.id);
+      const refundableMilli =
+        toMilli(item.quantity.toString()) - toMilli(item.refundedQuantity.toString()) - pending.reduce((s, p) => s + toMilli(p.quantity), 0);
+      const qtyMilli = toMilli(reqItem.quantity);
+      if (qtyMilli > refundableMilli) {
+        throw new HttpError(400, `You can refund at most ${fromMilli(refundableMilli)} ${item.unitLabel} of ${item.productName}.`);
+      }
+      // Refunding the whole remaining line uses the exact remaining cents, so rounding never drifts.
+      const lineCents =
+        qtyMilli === refundableMilli
+          ? item.lineSubtotalCents - item.refundedCents - pending.reduce((s, p) => s + p.lineCents, 0)
+          : lineTotalCents(item.unitPriceCents, qtyMilli);
+      const withTax = lineCents + (item.taxable ? taxCents(lineCents, order.taxRateBps) : 0);
+      items.push({
+        orderItemId: item.id,
+        productName: item.productName,
+        quantity: fromMilli(qtyMilli),
+        unitLabel: item.unitLabel,
+        lineCents,
+        amountCents: withTax,
+      });
+      amountCents += withTax;
+    }
+    amountCents = Math.min(amountCents, remaining);
+    if (amountCents <= 0) throw new HttpError(400, "Choose at least one item to refund.");
+  }
+  return { payment, amountCents, items, remainingBeforeCents: remaining, remainingAfterCents: remaining - amountCents };
+}
+
+/** What a refund would be, without doing it (for the confirmation screen). */
+export async function previewRefund(orderId: string, req: RefundRequest) {
+  const order = await db.order.findUnique({ where: { id: orderId }, include: refundableOrderInclude });
+  if (!order) throw new HttpError(404, "Order not found.");
+  const { payment, ...preview } = computeRefund(order, req);
+  return {
+    ...preview,
+    orderNumber: order.orderNumber,
+    originalTotalCents: order.totalCents,
+    alreadyRefundedCents: order.refundedCents,
+    payment: { method: paymentMethodLabel(payment), transactionId: payment.providerPaymentId },
+  };
+}
+
 /** Creates a refund with the processor. Amounts are computed and capped on the server. */
-export async function createRefund(orderId: string, req: RefundRequest, actor: Actor) {
+export async function createRefund(orderId: string, req: RefundRequest, actor: Actor, guard?: RefundGuard) {
   const { refund, payment } = await db.$transaction(async (tx) => {
     await lockOrder(tx, orderId);
-    const order = await tx.order.findUnique({
-      where: { id: orderId },
-      include: {
-        items: true,
-        payments: { where: { status: { in: PAID_STATES } }, orderBy: { createdAt: "desc" } },
-        refunds: { where: { status: "PENDING" } },
-      },
-    });
+    const order = await tx.order.findUnique({ where: { id: orderId }, include: refundableOrderInclude });
     if (!order || !order.orderNumber) throw new HttpError(404, "Order not found.");
-    const payment = order.payments[0];
-    if (!payment || !PAID_STATES.includes(order.paymentStatus)) throw new HttpError(409, "This order has nothing left to refund.");
-
-    const pendingCents = order.refunds.reduce((s, r) => s + r.amountCents, 0);
-    const remaining = order.totalCents - order.refundedCents - pendingCents;
-    if (remaining <= 0) throw new HttpError(409, "This order has already been fully refunded (or a refund is still processing).");
-
-    let amountCents = 0;
-    const items: RefundItemRecord[] = [];
-    if (req.type === "FULL" || req.type === "CANCELLATION") {
-      amountCents = remaining;
-    } else if (req.type === "PARTIAL") {
-      if (!Number.isInteger(req.amountCents) || req.amountCents <= 0) throw new HttpError(400, "Enter a refund amount.");
-      if (req.amountCents > remaining) throw new HttpError(400, `The most you can refund is ${formatMoney(remaining)}.`);
-      amountCents = req.amountCents;
-    } else {
-      const pendingItems = order.refunds.flatMap((r) => refundItems(r.items));
-      for (const reqItem of req.items) {
-        const item = order.items.find((i) => i.id === reqItem.orderItemId);
-        if (!item) throw new HttpError(400, "That item isn't part of this order.");
-        const pending = pendingItems.filter((p) => p.orderItemId === item.id);
-        const refundableMilli =
-          toMilli(item.quantity.toString()) - toMilli(item.refundedQuantity.toString()) - pending.reduce((s, p) => s + toMilli(p.quantity), 0);
-        const qtyMilli = toMilli(reqItem.quantity);
-        if (qtyMilli <= 0 || qtyMilli > refundableMilli) {
-          throw new HttpError(400, `You can refund at most ${fromMilli(refundableMilli)} ${item.unitLabel} of ${item.productName}.`);
-        }
-        // Refunding the whole remaining line uses the exact remaining cents, so rounding never drifts.
-        const lineCents =
-          qtyMilli === refundableMilli
-            ? item.lineSubtotalCents - item.refundedCents - pending.reduce((s, p) => s + p.lineCents, 0)
-            : lineTotalCents(item.unitPriceCents, qtyMilli);
-        const withTax = lineCents + (item.taxable ? taxCents(lineCents, order.taxRateBps) : 0);
-        items.push({ orderItemId: item.id, productName: item.productName, quantity: fromMilli(qtyMilli), lineCents, amountCents: withTax });
-        amountCents += withTax;
+    const { payment, amountCents, items } = computeRefund(order, req);
+    if (guard) {
+      if (guard.confirmOrderNumber.trim().toUpperCase() !== order.orderNumber) {
+        throw new HttpError(409, "The confirmed order number doesn't match this order.");
       }
-      amountCents = Math.min(amountCents, remaining);
-      if (amountCents <= 0) throw new HttpError(400, "Choose at least one item to refund.");
+      if (guard.expectedAmountCents !== amountCents) {
+        throw new HttpError(409, `The refund amount changed to ${formatMoney(amountCents)}. Please review and confirm again.`, {
+          code: "AMOUNT_CHANGED",
+          amountCents,
+        });
+      }
     }
 
     const refund = await tx.refund.create({
@@ -458,13 +508,28 @@ export async function createRefund(orderId: string, req: RefundRequest, actor: A
         paymentId: payment.id,
         type: req.type,
         amountCents,
+        reasonCategory: req.reasonCategory?.trim() || null,
         reason: req.reason?.trim() || null,
         items: items.length ? (items as unknown as Prisma.InputJsonValue) : undefined,
         createdById: actor.id,
       },
     });
     await audit(
-      { ...auditBy(actor), action: "REFUND_REQUESTED", entityType: "Order", entityId: orderId, data: { refundId: refund.id, type: req.type, amountCents } },
+      {
+        ...auditBy(actor),
+        action: "REFUND_STARTED",
+        entityType: "Order",
+        entityId: orderId,
+        data: {
+          orderNumber: order.orderNumber,
+          refundId: refund.id,
+          type: req.type,
+          amountCents,
+          items: items.map((i) => ({ productName: i.productName, quantity: i.quantity, amountCents: i.amountCents })),
+          reasonCategory: refund.reasonCategory,
+          reason: refund.reason,
+        },
+      },
       tx,
     );
     return { refund, payment };
@@ -477,7 +542,7 @@ export async function createRefund(orderId: string, req: RefundRequest, actor: A
       providerPaymentId: payment.providerPaymentId,
       amountCents: refund.amountCents,
       idempotencyKey: `refund-${refund.id}`,
-      reason: refund.reason,
+      reason: [refund.reasonCategory, refund.reason].filter(Boolean).join(": "),
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Refund failed";
@@ -499,7 +564,7 @@ async function restock(tx: Tx, orderId: string) {
 }
 
 /** Applies a refund the processor confirmed. Idempotent (webhook + API response may both call it). */
-export async function applyRefundSucceeded(refundId: string, actor: Actor = SYSTEM) {
+export async function applyRefundSucceeded(refundId: string, fallbackActor: Actor = SYSTEM) {
   const settings = await getSettings();
   const result = await db.$transaction(async (tx) => {
     const pre = await tx.refund.findUnique({ where: { id: refundId } });
@@ -508,6 +573,7 @@ export async function applyRefundSucceeded(refundId: string, actor: Actor = SYST
     const refund = await tx.refund.findUniqueOrThrow({ where: { id: refundId } });
     if (refund.status === "SUCCEEDED") return null;
 
+    const actor: Actor = refund.createdById ? { id: refund.createdById, role: "STAFF" } : fallbackActor;
     const order = await tx.order.findUniqueOrThrow({ where: { id: refund.orderId } });
     const refundedCents = Math.min(order.totalCents, order.refundedCents + refund.amountCents);
     const fully = refundedCents >= order.totalCents;
@@ -526,7 +592,7 @@ export async function applyRefundSucceeded(refundId: string, actor: Actor = SYST
       data: {
         refundedCents,
         paymentStatus,
-        ...(cancelling ? { status: "CANCELLED" as const, cancelledAt: new Date() } : {}),
+        ...(cancelling ? { status: "CANCELLED" as const, cancelledAt: new Date(), cancelledById: refund.createdById } : {}),
       },
     });
     await tx.payment.update({ where: { id: refund.paymentId }, data: { status: paymentStatus } });
@@ -554,10 +620,19 @@ export async function applyRefundSucceeded(refundId: string, actor: Actor = SYST
     await audit(
       {
         ...auditBy(actor),
-        action: "REFUND_SUCCEEDED",
+        action: cancelling ? "ORDER_CANCELLED" : "REFUND_COMPLETED",
         entityType: "Order",
         entityId: order.id,
-        data: { refundId, providerRefundId: refund.providerRefundId, amountCents: refund.amountCents, paymentStatus },
+        data: {
+          orderNumber: order.orderNumber,
+          refundId,
+          providerRefundId: refund.providerRefundId,
+          amountCents: refund.amountCents,
+          items: refundItems(refund.items).map((i) => ({ productName: i.productName, quantity: i.quantity, amountCents: i.amountCents })),
+          reasonCategory: refund.reasonCategory,
+          reason: refund.reason,
+          paymentStatus,
+        },
       },
       tx,
     );
@@ -603,7 +678,8 @@ export async function recordExternalRefund(providerPaymentId: string, providerRe
 }
 
 /** Cancels an order. Paid orders are refunded in full; stock goes back on the shelf. */
-export async function cancelOrder(orderId: string, actor: Actor, reason?: string) {
+export async function cancelOrder(orderId: string, actor: Actor, reasons: ReasonFields = {}, guard?: RefundGuard) {
+  const reason = reasons.reason;
   const order = await db.order.findUnique({
     where: { id: orderId },
     include: { payments: { orderBy: { createdAt: "desc" } }, refunds: { where: { status: "PENDING" } } },
@@ -611,6 +687,9 @@ export async function cancelOrder(orderId: string, actor: Actor, reason?: string
   if (!order) throw new HttpError(404, "Order not found.");
   if (order.status === "CANCELLED") return order;
   if (order.status === "COMPLETED") throw new HttpError(409, "Completed orders can't be cancelled. Issue a refund instead.");
+  if (guard && guard.confirmOrderNumber.trim().toUpperCase() !== order.orderNumber) {
+    throw new HttpError(409, "The confirmed order number doesn't match this order.");
+  }
 
   if (order.status === "AWAITING_PAYMENT") {
     // An unpaid draft: void the pending payment so it can never be charged later.
@@ -625,13 +704,13 @@ export async function cancelOrder(orderId: string, actor: Actor, reason?: string
 
   const pendingCents = order.refunds.reduce((s, r) => s + r.amountCents, 0);
   if (order.totalCents - order.refundedCents - pendingCents > 0) {
-    await createRefund(orderId, { type: "CANCELLATION", reason }, actor);
+    await createRefund(orderId, { type: "CANCELLATION", ...reasons }, actor, guard);
   } else {
     const notification = await db.$transaction(async (tx) => {
       await lockOrder(tx, orderId);
-      await tx.order.update({ where: { id: orderId }, data: { status: "CANCELLED", cancelledAt: new Date() } });
+      await tx.order.update({ where: { id: orderId }, data: { status: "CANCELLED", cancelledAt: new Date(), cancelledById: actor.id } });
       await restock(tx, orderId);
-      await audit({ ...auditBy(actor), action: "ORDER_CANCELLED", entityType: "Order", entityId: orderId, data: { reason: reason ?? null } }, tx);
+      await audit({ ...auditBy(actor), action: "ORDER_CANCELLED", entityType: "Order", entityId: orderId, data: { orderNumber: order.orderNumber, ...reasons } }, tx);
       return createNotification(tx, {
         userId: order.userId,
         orderId,

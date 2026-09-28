@@ -1,4 +1,4 @@
-import { avatarUrl, requireUser } from "@/lib/auth-helpers";
+import { avatarUrl, isStaff, requireUser } from "@/lib/auth-helpers";
 import { db } from "@/lib/db";
 import { CartProvider } from "@/components/cart/CartProvider";
 import { ToastProvider } from "@/components/shell/Toaster";
@@ -18,7 +18,7 @@ export default async function ShopLayout({ children }: LayoutProps<"/">) {
           <a href="#main" className="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-50 focus:rounded-lg focus:bg-white focus:p-3">
             Skip to content
           </a>
-          <AppHeader name={user.name} imageUrl={avatarUrl(user)} />
+          <AppHeader name={user.name} imageUrl={avatarUrl(user)} staff={isStaff(user.role)} />
           <main id="main" className="pb-nav mx-auto w-full max-w-6xl px-4 pt-5">
             {children}
           </main>

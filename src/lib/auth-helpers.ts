@@ -5,6 +5,7 @@ import { auth } from "@/auth";
 import { db } from "./db";
 import { HttpError } from "./http";
 import { Role } from "@/generated/prisma/enums";
+import { can, type Permission } from "./permissions";
 
 export const STAFF_ROLES: Role[] = [Role.STORE_EMPLOYEE, Role.STORE_MANAGER, Role.ADMIN];
 export const MANAGER_ROLES: Role[] = [Role.STORE_MANAGER, Role.ADMIN];
@@ -34,6 +35,26 @@ export async function apiUser(roles?: Role[]) {
   if (!user) throw new HttpError(401, "Please sign in.");
   if (roles && !roles.includes(user.role)) throw new HttpError(403, "You don't have permission to do that.");
   return user;
+}
+
+/** For API routes: requires a store permission (see lib/permissions.ts). */
+export async function apiStaff(permission: Permission) {
+  const user = await apiUser();
+  if (!can(user.role, permission)) throw new HttpError(403, "You don't have permission to do that.");
+  return user;
+}
+
+/** For store pages: sends signed-out users to the store login and blocks anyone without the permission. */
+export async function requireStaff(permission: Permission = "viewOrders") {
+  const user = await currentUser();
+  if (!user) redirect("/store/login");
+  if (!isStaff(user.role)) redirect("/store/not-authorized");
+  if (!can(user.role, permission)) redirect("/store?denied=1");
+  return user;
+}
+
+export function actorOf(user: CurrentUser, ip: string | null = null) {
+  return { id: user.id, role: user.role, ip };
 }
 
 export function isStaff(role: Role) {

@@ -1,21 +1,17 @@
 import { NextResponse } from "next/server";
-import { apiUser, STAFF_ROLES } from "@/lib/auth-helpers";
-import { db } from "@/lib/db";
+import { apiStaff } from "@/lib/auth-helpers";
 import { handle } from "@/lib/http";
-import { OrderStatus } from "@/generated/prisma/enums";
+import { searchOrders } from "@/lib/store/orders";
 
-// Store app: confirmed orders, newest first. ?status=IN_PROGRESS,READY_FOR_PICKUP
+// Search confirmed orders: ?q=YYC-2026-001245 | name | email, &status=IN_PROGRESS,READY_FOR_PICKUP, &payment=REFUNDED
 export const GET = handle(async (req: Request) => {
-  await apiUser(STAFF_ROLES);
+  await apiStaff("viewOrders");
   const url = new URL(req.url);
-  const statuses = (url.searchParams.get("status") ?? "")
-    .split(",")
-    .filter((s): s is OrderStatus => Object.values(OrderStatus).includes(s as OrderStatus));
-  const orders = await db.order.findMany({
-    where: { orderNumber: { not: null }, ...(statuses.length ? { status: { in: statuses } } : {}) },
-    orderBy: { paidAt: "desc" },
-    take: Math.min(Number(url.searchParams.get("limit") ?? 100), 500),
-    include: { items: true },
+  const orders = await searchOrders({
+    q: url.searchParams.get("q"),
+    status: url.searchParams.get("status"),
+    payment: url.searchParams.get("payment"),
+    limit: Number(url.searchParams.get("limit") ?? 100),
   });
   return NextResponse.json({ orders });
 });
