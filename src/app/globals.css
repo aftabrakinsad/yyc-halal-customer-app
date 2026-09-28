@@ -1,0 +1,110 @@
+@import "tailwindcss";
+
+/* YYC Halal brand tokens */
+@theme {
+  --color-brand-50: #eef7f1;
+  --color-brand-100: #d5ecdd;
+  --color-brand-200: #a9d8ba;
+  --color-brand-500: #13874a;
+  --color-brand-600: #0b6b3a;
+  --color-brand-700: #08552e;
+  --color-brand-800: #063f22;
+  --color-accent-500: #c8102e; /* Calgary red */
+  --color-accent-50: #fdecee;
+  --color-gold-400: #f2c14e;
+  --color-cream: #f7f6f1;
+  --color-ink: #1c1f1d;
+  --color-muted: #5c635e;
+  --color-line: #e3e5e0;
+  --font-sans: var(--font-figtree), ui-sans-serif, system-ui, sans-serif;
+  --radius-card: 1rem;
+}
+
+:root {
+  color-scheme: light;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  background: var(--color-cream);
+  color: var(--color-ink);
+  font-size: 1.0625rem; /* 17px — a little larger for easy reading */
+}
+
+:focus-visible {
+  outline: 3px solid var(--color-gold-400);
+  outline-offset: 2px;
+}
+
+@layer components {
+  .btn,
+  .btn-primary,
+  .btn-secondary,
+  .btn-ghost,
+  .btn-danger {
+    @apply inline-flex min-h-12 items-center justify-center gap-2 rounded-xl px-5 text-base font-bold transition-colors select-none disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply bg-brand-600 text-white hover:bg-brand-700 active:bg-brand-800;
+  }
+  .btn-secondary {
+    @apply border-2 border-brand-600 bg-white text-brand-700 hover:bg-brand-50;
+  }
+  .btn-ghost {
+    @apply text-brand-700 hover:bg-brand-50;
+  }
+  .btn-danger {
+    @apply border-2 border-accent-500 bg-white text-accent-500 hover:bg-accent-50;
+  }
+  .card {
+    @apply rounded-[var(--radius-card)] border border-line bg-white shadow-sm;
+  }
+  .input {
+    @apply min-h-12 w-full rounded-xl border-2 border-line bg-white px-4 text-base outline-none focus:border-brand-600;
+  }
+  .page-title {
+    @apply text-2xl font-extrabold tracking-tight text-ink sm:text-3xl;
+  }
+}
+
+/* Size modifier lives in the utilities layer so it overrides the base button size. */
+@layer utilities {
+  .btn-lg {
+    min-height: 3.5rem;
+    padding-inline: 1.5rem;
+    font-size: 1.125rem;
+  }
+}
+
+/* Leave room for the fixed bottom navigation on phones (including the iPhone home indicator). */
+.pb-nav {
+  padding-bottom: calc(5.5rem + env(safe-area-inset-bottom));
+}
+@media (min-width: 768px) {
+  .pb-nav {
+    padding-bottom: 2rem;
+  }
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: #fff;
+  }
+  .print-plain {
+    box-shadow: none !important;
+    border: none !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}

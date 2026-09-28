@@ -1,0 +1,353 @@
+// YYC Halal — shared database for the Customer app and the Store Management app.
+// Money is stored as integer cents. Quantities are Decimal(10,3) so weighed items (lb/kg) work.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Users & auth ─────────────────────────────
+
+enum Role {
+  CUSTOMER
+  STORE_EMPLOYEE
+  STORE_MANAGER
+  ADMIN
+}
+
+model User {
+  id              String    @id @default(cuid())
+  googleSub       String?   @unique // Google account id ("sub"). Passwords are never stored.
+  email           String    @unique
+  name            String
+  googleImageUrl  String?
+  avatarData      Bytes? // customer-uploaded profile picture (resized WebP)
+  avatarUpdatedAt DateTime?
+  role            Role      @default(CUSTOMER)
+  disabled        Boolean   @default(false)
+  createdAt       DateTime  @default(now())
+  lastLoginAt     DateTime?
+  updatedAt       DateTime  @updatedAt
+
+  orders            Order[]
+  notifications     Notification[]
+  pushSubscriptions PushSubscription[]
+  refundsCreated    Refund[]           @relation("RefundCreatedBy")
+  auditLogs         AuditLog[]
+}
+
+// ───────────────────────────── Catalog ─────────────────────────────
+
+model Category {
+  id        String    @id @default(cuid())
+  name      String
+  slug      String    @unique
+  sortOrder Int       @default(0)
+  products  Product[]
+}
+
+/// Units of measurement. New units (kg, pack, box…) are added as rows — no code change needed.
+model Unit {
+  code          String    @id // "LB", "ITEM", "KG"…
+  label         String // short label shown after a price: "lb", "item"
+  description   String // "per pound"
+  allowsDecimal Boolean   @default(false)
+  step          Decimal   @default(1) @db.Decimal(10, 3)
+  minQuantity   Decimal   @default(1) @db.Decimal(10, 3)
+  maxQuantity   Decimal   @default(100) @db.Decimal(10, 3)
+  products      Product[]
+}
+
+model Product {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique
+  description String   @default("")
+  imageUrl    String?
+  priceCents  Int
+  unitCode    String
+  unit        Unit     @relation(fields: [unitCode], references: [code])
+  categoryId  String?
+  category    Category? @relation(fields: [categoryId], references: [id])
+  taxable     Boolean  @default(true)
+  active      Boolean  @default(true) // hidden from customers when false
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  inventory  Inventory?
+  orderItems OrderItem[]
+}
+
+model Inventory {
+  productId        String   @id
+  product          Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  quantityOnHand   Decimal  @default(0) @db.Decimal(12, 3)
+  trackQuantity    Boolean  @default(true) // false = unlimited, only the manual flag applies
+  markedOutOfStock Boolean  @default(false) // staff override
+  updatedAt        DateTime @updatedAt
+}
+
+// ───────────────────────────── Orders ─────────────────────────────
+
+enum OrderStatus {
+  AWAITING_PAYMENT // draft created at checkout; not a confirmed order and not shown to the customer
+  IN_PROGRESS
+  READY_FOR_PICKUP
+  COMPLETED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  PARTIALLY_REFUNDED
+  REFUNDED
+  CANCELLED
+}
+
+model Order {
+  id             String        @id @default(cuid())
+  orderNumber    String?       @unique // assigned only after successful payment, e.g. YYC-2026-001245
+  userId         String
+  user           User          @relation(fields: [userId], references: [id])
+  status         OrderStatus   @default(AWAITING_PAYMENT)
+  paymentStatus  PaymentStatus @default(PENDING)
+  customerName   String
+  customerEmail  String
+  subtotalCents  Int
+  taxCents       Int
+  totalCents     Int
+  refundedCents  Int           @default(0)
+  taxRateBps     Int // tax rate used, in basis points (500 = 5%)
+  taxLabel       String
+  currency       String        @default("cad")
+  checkoutKey    String        @unique // idempotency key from the checkout screen
+  cartHash       String
+  receiptEmailAt DateTime?
+  paidAt         DateTime?
+  readyAt        DateTime?
+  completedAt    DateTime?
+  cancelledAt    DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  items         OrderItem[]
+  payments      Payment[]
+  refunds       Refund[]
+  notifications Notification[]
+  printJobs     PrintJob[]
+
+  @@index([userId, createdAt])
+  @@index([status])
+}
+
+model OrderItem {
+  id                String  @id @default(cuid())
+  orderId           String
+  order             Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId         String
+  product           Product @relation(fields: [productId], references: [id])
+  productName       String // snapshot at purchase time
+  imageUrl          String?
+  unitCode          String
+  unitLabel         String
+  unitPriceCents    Int
+  quantity          Decimal @db.Decimal(10, 3)
+  lineSubtotalCents Int
+  taxable           Boolean
+  refundedQuantity  Decimal @default(0) @db.Decimal(10, 3)
+  refundedCents     Int     @default(0)
+  stockDeducted     Boolean @default(false) // inventory was decremented for this line at payment time
+
+  @@index([orderId])
+}
+
+/// Year-scoped counter used to issue sequential, never-duplicated order numbers.
+model OrderCounter {
+  year      Int @id
+  lastValue Int @default(0)
+}
+
+// ───────────────────────────── Payments & refunds ─────────────────────────────
+// Only processor-provided, non-sensitive data is stored. No card numbers or CVV — ever.
+
+model Payment {
+  id                String        @id @default(cuid())
+  orderId           String
+  order             Order         @relation(fields: [orderId], references: [id])
+  provider          String // "stripe" | "mock"
+  providerPaymentId String        @unique // e.g. Stripe PaymentIntent id
+  status            PaymentStatus @default(PENDING)
+  methodType        String? // "card", "apple_pay", "google_pay"…
+  cardBrand         String?
+  last4             String?
+  amountCents       Int
+  currency          String        @default("cad")
+  failureMessage    String?
+  paidAt            DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  refunds Refund[]
+}
+
+enum RefundType {
+  FULL
+  PARTIAL
+  ITEM
+  CANCELLATION
+}
+
+enum RefundStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+model Refund {
+  id               String       @id @default(cuid())
+  orderId          String
+  order            Order        @relation(fields: [orderId], references: [id])
+  paymentId        String
+  payment          Payment      @relation(fields: [paymentId], references: [id])
+  providerRefundId String?      @unique
+  type             RefundType
+  status           RefundStatus @default(PENDING)
+  amountCents      Int
+  reason           String?
+  items            Json? // [{ orderItemId, productName, quantity, amountCents }]
+  createdById      String?
+  createdBy        User?        @relation("RefundCreatedBy", fields: [createdById], references: [id])
+  createdAt        DateTime     @default(now())
+  succeededAt      DateTime?
+
+  @@index([orderId])
+}
+
+model WebhookEvent {
+  id          String   @id // provider event id
+  type        String
+  processedAt DateTime @default(now())
+}
+
+// ───────────────────────────── Content, notifications, settings ─────────────────────────────
+
+enum FlyerKind {
+  FLYER
+  SALE
+  PROMOTION
+  SPECIAL_OFFER
+  ANNOUNCEMENT
+}
+
+model Flyer {
+  id        String    @id @default(cuid())
+  kind      FlyerKind @default(FLYER)
+  title     String
+  subtitle  String?
+  body      String?
+  imageUrl  String?
+  linkUrl   String?
+  active    Boolean   @default(true)
+  startsAt  DateTime?
+  endsAt    DateTime?
+  sortOrder Int       @default(0)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+}
+
+enum NotificationType {
+  ORDER_RECEIVED // payment succeeded + order received (one notification, not two)
+  ORDER_READY
+  ORDER_COMPLETED
+  REFUND_FULL
+  REFUND_PARTIAL
+  ORDER_CANCELLED
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orderId   String?
+  order     Order?           @relation(fields: [orderId], references: [id])
+  type      NotificationType
+  title     String
+  body      String
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model PushSubscription {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now())
+}
+
+/// Single-row table (id = 1) controlled from the Store Management app.
+model StoreSettings {
+  id                 Int      @id @default(1)
+  storeName          String   @default("YYC Halal Meat Shop")
+  addressLine        String   @default("Calgary, AB")
+  phone              String   @default("")
+  email              String   @default("")
+  taxRateBps         Int      @default(500) // 5% GST
+  taxLabel           String   @default("GST")
+  currency           String   @default("cad")
+  pickupInstructions String   @default("Please bring your order number to the counter.")
+  receiptFooter      String   @default("Thank you for shopping at YYC Halal!")
+  autoPrintReceipts  Boolean  @default(true)
+  emailWhenReady     Boolean  @default(true)
+  acceptingOrders    Boolean  @default(true)
+  updatedAt          DateTime @updatedAt
+}
+
+enum PrintJobStatus {
+  PENDING
+  PRINTED
+  FAILED
+}
+
+/// Queue consumed by the store's POS receipt-printer agent.
+model PrintJob {
+  id        String         @id @default(cuid())
+  orderId   String
+  order     Order          @relation(fields: [orderId], references: [id])
+  kind      String         @default("RECEIPT") // RECEIPT | REFUND
+  status    PrintJobStatus @default(PENDING)
+  attempts  Int            @default(0)
+  error     String?
+  createdAt DateTime       @default(now())
+  printedAt DateTime?
+
+  @@index([status, createdAt])
+}
+
+/// Append-only audit trail (UPDATE/DELETE are blocked by a database trigger).
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation(fields: [actorId], references: [id])
+  actorRole  String? // CUSTOMER, STORE_MANAGER, SYSTEM, WEBHOOK…
+  action     String // e.g. ORDER_PAID, ORDER_STATUS_CHANGED, REFUND_CREATED
+  entityType String
+  entityId   String
+  data       Json?
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
